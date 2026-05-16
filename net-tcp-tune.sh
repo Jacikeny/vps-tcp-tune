@@ -8,14 +8,14 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时只修改 SCRIPT_LAST_UPDATE，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.0.1 更新: 修复 XanMod 官方源 releases 为空导致 BBR v3 内核安装找不到 linux-xanmod-x64v3；改为按系统 codename 写源并校验包存在；修复 CF Tunnel 带引号 --config 解析 (by Eric86777)
 # v5.0.0 更新: 新增 Cloudflare Tunnel 管理模块 (菜单 32-7)：12 项子功能 + 6 步向导含失败自动回滚；修复 Sub-Store 6 个历史 bug；统一配置到 /etc/cloudflared/ 并自动迁移老路径 (by Eric86777)
 # v4.9.8 更新: 修复Snell/VLESS/OAI2节点随机掉线：Restart=always+systemd健壮性加固；XanMod内核安装增加本地CPU检测兜底 (by Eric86777)
 # v4.9.5 更新: 修复Responses API代理SSE解析，解决502报错，重新部署生效 (by Eric86777)
 # v4.9.4 更新: 修复Responses API转换代理：兼容SSE流式响应格式，解决502 JSON解析失败 (by Eric86777)
-# v4.9.3 更新: 修复Responses API转换代理：system消息正确提取为instructions字段，修复无system消息时报错 (by Eric86777)
 
-SCRIPT_VERSION="5.0.0"
-SCRIPT_LAST_UPDATE="新增 Cloudflare Tunnel 管理模块(32-7):一键安装/添加/修改/删除/启停/日志/切换账户,含失败自动回滚 + 老配置迁移"
+SCRIPT_VERSION="5.0.1"
+SCRIPT_LAST_UPDATE="修复 BBR v3/XanMod 安装:官方 releases 源为空时自动使用系统 codename 源；校验可用内核包；修复 CF Tunnel --config 解析"
 #=============================================================================
 
 #=============================================================================
@@ -2745,6 +2745,78 @@ check_bbr_status() {
 # XanMod 内核安装（官方源）
 #=============================================================================
 
+xanmod_get_repo_suite() {
+    local suite=""
+
+    if [ -r /etc/os-release ]; then
+        suite=$( ( . /etc/os-release; printf '%s' "${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}" ) )
+    fi
+
+    if [ -z "$suite" ] && command -v lsb_release &>/dev/null; then
+        suite=$(lsb_release -sc 2>/dev/null)
+    fi
+
+    if [ -z "$suite" ]; then
+        echo -e "${gl_hong}错误: 无法识别系统发行版 codename，不能添加 XanMod 软件源${gl_bai}" >&2
+        return 1
+    fi
+
+    case "$suite" in
+        bookworm|trixie|forky|sid|noble|plucky|questing|resolute|faye|gigi|wilma|xia|zara|zena)
+            ;;
+        *)
+            echo -e "${gl_huang}警告: 当前发行版 codename 为 ${suite}，可能不在 XanMod 官方支持列表中${gl_bai}" >&2
+            ;;
+    esac
+
+    echo "$suite"
+}
+
+xanmod_write_repo() {
+    local gpg_key_file=$1
+    local repo_file=$2
+    local suite
+
+    suite=$(xanmod_get_repo_suite) || return 1
+    echo "deb [signed-by=${gpg_key_file}] https://deb.xanmod.org ${suite} main" | \
+        tee "$repo_file" > /dev/null
+    echo -e "${gl_lv}✅ XanMod 软件源: ${suite}${gl_bai}"
+}
+
+xanmod_select_kernel_package() {
+    local version=$1
+    local candidates=()
+
+    case "$version" in
+        1)
+            candidates=("linux-xanmod-lts-x64v1")
+            ;;
+        2)
+            candidates=("linux-xanmod-x64v2" "linux-xanmod-lts-x64v2")
+            ;;
+        3)
+            candidates=("linux-xanmod-x64v3" "linux-xanmod-lts-x64v3")
+            ;;
+        4)
+            # XanMod 官方 mainline 当前不提供 x64v4；v4 CPU 使用 x64v3 更稳妥。
+            candidates=("linux-xanmod-x64v3" "linux-xanmod-lts-x64v3")
+            ;;
+        *)
+            candidates=("linux-xanmod-x64v3" "linux-xanmod-lts-x64v3")
+            ;;
+    esac
+
+    local pkg
+    for pkg in "${candidates[@]}"; do
+        if apt-cache show "$pkg" >/dev/null 2>&1; then
+            echo "$pkg"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 install_xanmod_kernel() {
     clear
     echo -e "${gl_kjlan}=== 安装 XanMod 内核与 BBR v3 ===${gl_bai}"
@@ -2910,9 +2982,8 @@ install_xanmod_kernel() {
 
     local xanmod_repo_file="/etc/apt/sources.list.d/xanmod-release.list"
 
-    # 添加 XanMod 仓库（使用 HTTPS）
-    echo "deb [signed-by=${gpg_key_file}] https://deb.xanmod.org releases main" | \
-        tee "$xanmod_repo_file" > /dev/null
+    # 添加 XanMod 仓库（使用系统 codename；旧 releases suite 已为空）
+    xanmod_write_repo "$gpg_key_file" "$xanmod_repo_file" || return 1
 
     # 检测 CPU 架构版本（使用安全临时目录）
     echo "正在检测 CPU 支持的最优内核版本..."
@@ -2943,15 +3014,30 @@ install_xanmod_kernel() {
         echo -e "${gl_lv}本地检测结果: CPU 支持 x86-64-v${version}${gl_bai}"
     fi
 
-    echo -e "${gl_lv}将安装: linux-xanmod-x64v${version}${gl_bai}"
-
     # 安装 XanMod 内核
     echo "正在更新软件包列表..."
     if ! apt-get update; then
         echo -e "${gl_huang}⚠️  apt-get update 部分失败，尝试继续安装...${gl_bai}"
     fi
 
-    apt-get install -y "linux-xanmod-x64v${version}"
+    local xanmod_package
+    xanmod_package=$(xanmod_select_kernel_package "$version")
+    if [ -z "$xanmod_package" ]; then
+        echo -e "${gl_hong}错误: 未找到适合 x86-64-v${version} 的 XanMod 内核包${gl_bai}"
+        echo -e "${gl_huang}可用包参考:${gl_bai}"
+        apt-cache search '^linux-xanmod' 2>/dev/null | awk '{print "  - " $1}' | head -20
+        rm -f "$xanmod_repo_file"
+        return 1
+    fi
+
+    echo -e "${gl_lv}将安装: ${xanmod_package}${gl_bai}"
+    if [ "$version" = "4" ] && echo "$xanmod_package" | grep -q 'x64v3'; then
+        echo -e "${gl_huang}说明: XanMod 官方 mainline 当前不提供 x64v4，x86-64-v4 CPU 使用 x64v3 包${gl_bai}"
+    elif [ "$version" = "1" ] && echo "$xanmod_package" | grep -q 'lts'; then
+        echo -e "${gl_huang}说明: XanMod 官方 mainline 当前不提供 x64v1，x86-64-v1 CPU 使用 LTS 包${gl_bai}"
+    fi
+
+    apt-get install -y "$xanmod_package"
 
     if [ $? -ne 0 ]; then
         echo -e "${gl_hong}内核安装失败！${gl_bai}"
@@ -2960,7 +3046,7 @@ install_xanmod_kernel() {
     fi
 
     # 验证内核是否真正安装成功
-    if ! dpkg -l 2>/dev/null | grep -qE "^ii\s+linux-xanmod-x64v${version}"; then
+    if ! dpkg -l 2>/dev/null | awk -v pkg="$xanmod_package" '$1 == "ii" && $2 == pkg { found=1 } END { exit !found }'; then
         echo -e "${gl_hong}内核包安装验证失败！${gl_bai}"
         rm -f "$xanmod_repo_file"
         return 1
@@ -2971,9 +3057,9 @@ install_xanmod_kernel() {
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━ CPU 架构信息 ━━━━━━━━━━${gl_bai}"
     echo -e "  CPU 架构等级: ${gl_lv}x86-64-v${version}${gl_bai}"
-    echo -e "  安装内核版本: ${gl_lv}linux-xanmod-x64v${version}${gl_bai}"
-    echo -e "  ${gl_huang}说明: 本机 CPU 最高支持 v${version}，已安装该等级的最新内核${gl_bai}"
-    echo -e "  ${gl_huang}不同等级(v1-v4)的内核更新进度可能不同，以 XanMod 官方仓库为准${gl_bai}"
+    echo -e "  安装内核包: ${gl_lv}${xanmod_package}${gl_bai}"
+    echo -e "  ${gl_huang}说明: 本机 CPU 最高支持 v${version}，已安装官方仓库中最匹配的内核包${gl_bai}"
+    echo -e "  ${gl_huang}官方 mainline 当前提供 x64v2/x64v3；x64v1 使用 LTS，x64v4 使用 x64v3${gl_bai}"
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
     echo ""
     echo -e "${gl_kjlan}后续更新: 再次运行选项1即可检查并安装最新内核${gl_bai}"
@@ -6652,8 +6738,8 @@ update_xanmod_kernel() {
     
     local xanmod_repo_file="/etc/apt/sources.list.d/xanmod-release.list"
 
-    # 添加 XanMod 仓库（如果不存在）
-    if [ ! -f "$xanmod_repo_file" ]; then
+    # 添加/修正 XanMod 仓库（旧 releases suite 已为空）
+    if [ ! -f "$xanmod_repo_file" ] || grep -qE 'deb\.xanmod\.org[[:space:]]+releases[[:space:]]+' "$xanmod_repo_file" 2>/dev/null; then
         echo "正在添加 XanMod 仓库..."
 
         # 添加密钥（分步执行，避免管道 $? 问题）
@@ -6685,9 +6771,8 @@ update_xanmod_kernel() {
             return 1
         fi
 
-        # 添加仓库（HTTPS）
-        echo "deb [signed-by=${gpg_key_file}] https://deb.xanmod.org releases main" | \
-            tee "$xanmod_repo_file" > /dev/null
+        # 添加仓库（使用系统 codename；旧 releases suite 已为空）
+        xanmod_write_repo "$gpg_key_file" "$xanmod_repo_file" || { break_end; return 1; }
     fi
 
     # 更新软件包列表
@@ -14025,7 +14110,20 @@ _cf_get_config_from_service() {
     local service=$1
     local unit="/etc/systemd/system/${service}.service"
     [ -f "$unit" ] || return 1
-    grep -oE -- '--config [^ ]+\.(yaml|yml)' "$unit" | awk '{print $2}' | head -1
+
+    local line config_arg
+    line=$(grep -E 'ExecStart=.*--config([=[:space:]]|$)' "$unit" | head -1)
+    [ -z "$line" ] && return 1
+
+    config_arg="${line#*--config}"
+    config_arg="${config_arg#=}"
+    config_arg="${config_arg#"${config_arg%%[![:space:]]*}"}"
+
+    case "$config_arg" in
+        \"*) config_arg="${config_arg#\"}"; echo "${config_arg%%\"*}" ;;
+        \'*) config_arg="${config_arg#\'}"; echo "${config_arg%%\'*}" ;;
+        *) echo "${config_arg%%[[:space:]]*}" ;;
+    esac
 }
 
 # 从 config yaml 读单个字段(tunnel / credentials-file 等)

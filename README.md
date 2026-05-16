@@ -1,10 +1,10 @@
-# BBR v3 优化脚本 - Ultimate Edition v5.0.0
+# BBR v3 优化脚本 - Ultimate Edition v5.0.1
 
 **XanMod 内核 + BBR v3 + 全方位 VPS 管理工具集**
 
 一键安装 XanMod 内核，启用 BBR v3 拥塞控制，集成 32 项实用功能，优化你的 VPS 服务器。
 
-> **版本**: v5.0.0 🎉 **重大更新**：新增 Cloudflare Tunnel 管理模块（菜单 32-7）
+> **版本**: v5.0.1 🔧 **修复更新**：修复 XanMod 官方 `releases` 源为空导致 BBR v3 内核安装找不到 `linux-xanmod-x64v3`，并修复 Cloudflare Tunnel 配置解析
 
 ---
 
