@@ -8,14 +8,14 @@
 # 1. 正式版本迭代时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 临时热修/不发版时只修改 SCRIPT_LAST_UPDATE，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.1.0 更新: Snell 菜单新增「12-8 v6 Beta 测试专区」：独立二进制/服务/配置/保留端口，与 v5 完全隔离，含装/卸/查/更新+修复/健康检查 (by Eric86777)
 # v5.0.6 更新: 代码质量大扫除：Snell 下载逻辑合并去重+unzip 完整性校验、版本号常量化、删除死代码/死变量、修复 15 处引号分词隐患、Xray 子脚本错误处理加固 (by Eric86777)
 # v5.0.5 更新: 修复 bbr 快捷命令在存在异常 ~/.curlrc/Authorization 配置时可能 curl 401 的问题，别名改用 curl -q (by Eric86777)
 # v5.0.4 更新: Snell 12-4 改为一键修复不通/掉线：补齐旧实例 systemd/端口保留/每日重启兜底并保留核心更新入口 (by Eric86777)
 # v5.0.3 更新: 修复 Xray Reality 密钥对解析兼容性，适配 Private key/Public key 输出格式 (by Eric86777)
-# v5.0.2 更新: 修复 Snell 查看节点配置换 IP 后仍输出旧 IP；修复 Xray 子菜单 warning 调用和默认端口交互；同步 README 功能描述 (by Eric86777)
 
-SCRIPT_VERSION="5.0.6"
-SCRIPT_LAST_UPDATE="代码质量大扫除：Snell 下载去重+完整性校验、死代码清理、引号分词修复"
+SCRIPT_VERSION="5.1.0"
+SCRIPT_LAST_UPDATE="Snell 新增 v6 Beta 测试专区（12-8），与 v5 完全隔离"
 #=============================================================================
 
 #=============================================================================
@@ -111,6 +111,7 @@ SYSCTL_CONF="/etc/sysctl.d/99-bbr-ultimate.conf"
 # 版本号（SCRIPT_VERSION / SCRIPT_LAST_UPDATE 在文件头部定义）
 readonly CADDY_DEFAULT_VERSION="2.10.2"
 readonly SNELL_DEFAULT_VERSION="5.0.1"
+readonly SNELL_V6_DEFAULT_VERSION="6.0.0b1"
 
 #=============================================================================
 # 日志系统
@@ -8964,6 +8965,7 @@ snell_menu() {
         echo "5. 更新 Snell 核心程序（低频）"
         echo "6. Snell 健康检查（只检测）"
         echo "7. 查看 Snell 配置"
+        echo "8. Snell v6 Beta 测试专区 🧪"
         echo "0. 返回主菜单"
         echo "======================"
         read -p "请输入选项编号: " snell_choice
@@ -9016,6 +9018,1028 @@ snell_menu() {
                     echo ""
                     read -n 1 -s -r -p "按任意键继续..."
                 fi
+                ;;
+            8) snellv6_menu ;;
+            0) return ;;
+            *) echo -e "${SNELL_RED}无效选项${SNELL_RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+#=============================================================================
+# 星辰大海 Snell v6 Beta 测试专区（与 v5 完全隔离，独立命名空间）
+# 隔离要点：二进制 snell-server-v6 / 服务 snellv6-{port}.service / 配置 /etc/snell-v6/
+#           / 保留端口文件 99-zzy(排在 v5 的 zzz 之前) / cron 标记 SnellV6每日重启 / 锁 fd 202
+# 铁律：v6 绝不触碰 v5 的任何文件、服务、内核保留端口 runtime。详见 docs/plans/snellv6-design.md
+#=============================================================================
+
+# v6 全局常量（全部 SNELLV6_ 前缀，避免与 v5/主脚本变量碰撞）
+SNELLV6_BIN="/usr/local/bin/snell-server-v6"
+SNELLV6_CONF_DIR="/etc/snell-v6"
+SNELLV6_VERSION_FILE="/etc/snell-v6/.binary-version"
+SNELLV6_RESERVED_FILE="/etc/sysctl.d/99-zzy-snellv6-reserved-ports.conf"
+SNELLV6_DAILY_WRAPPER="/usr/local/bin/snellv6-daily-restart.sh"
+SNELLV6_LOCK_FILE="/tmp/net-tcp-tune-snellv6.lock"
+SNELLV6_LOG_FILE="/var/log/snellv6_manager.log"
+
+# 统一发现 v6 unit（只认 snellv6-数字.service，绝不纳入 v5 的 snell-*.service / snell.service）
+snellv6_list_units() {
+    {
+        local svc_file
+        for svc_file in \
+            /etc/systemd/system/snellv6-*.service \
+            /lib/systemd/system/snellv6-*.service \
+            /usr/lib/systemd/system/snellv6-*.service; do
+            [ -f "$svc_file" ] || continue
+            basename "$svc_file"
+        done
+
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl list-unit-files 'snellv6-*.service' --no-legend --no-pager 2>/dev/null \
+                | awk '{u=$1; if (u=="●") u=$2; print u}'
+            systemctl list-units 'snellv6-*.service' --all --no-legend --no-pager 2>/dev/null \
+                | awk '{u=$1; if (u=="●") u=$2; print u}'
+        fi
+    } | awk '/^snellv6-[0-9]+\.service$/ { if (!seen[$1]++) print $1 }'
+}
+
+# 从 snellv6-{port}.service 提取端口
+snellv6_unit_port() {
+    local unit="$1"
+    local port=""
+    case "$unit" in
+        snellv6-[0-9]*.service)
+            port="${unit#snellv6-}"
+            port="${port%.service}"
+            ;;
+    esac
+    if snell_valid_port "$port"; then
+        echo "$port"
+        return 0
+    fi
+    return 1
+}
+
+# v6 操作锁（fd 202，与 v5 的 201 错开）
+snellv6_acquire_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        exec 202>"$SNELLV6_LOCK_FILE"
+        if ! flock -n 202; then
+            echo -e "${SNELL_YELLOW}另一个 Snell v6 操作正在运行，已取消本次操作。${SNELL_RESET}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+snellv6_release_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        flock -u 202 2>/dev/null || true
+    fi
+}
+
+# 下载并校验 v6 二进制（成功 stdout 输出临时目录，调用方负责 rm -rf；临时文件均 snellv6- 前缀）
+snellv6_download_binary() {
+    local arch version snell_url tmp_zip tmp_dir
+    arch=$(uname -m)
+    version="v${SNELL_V6_DEFAULT_VERSION}"
+    case "$arch" in
+        aarch64|arm64)
+            snell_url="https://dl.nssurge.com/snell/snell-server-${version}-linux-aarch64.zip"
+            ;;
+        x86_64|amd64)
+            snell_url="https://dl.nssurge.com/snell/snell-server-${version}-linux-amd64.zip"
+            ;;
+        *)
+            echo -e "${SNELL_RED}不支持的架构: ${arch}（仅支持 x86_64 / aarch64）${SNELL_RESET}" >&2
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - v6 不支持的架构: ${arch}" >> "$SNELLV6_LOG_FILE"
+            return 1
+            ;;
+    esac
+
+    tmp_zip=$(mktemp /tmp/snellv6-server.XXXXXX.zip) || return 1
+    tmp_dir=$(mktemp -d /tmp/snellv6-dl.XXXXXX) || { rm -f "$tmp_zip"; return 1; }
+
+    echo -e "${SNELL_GREEN}正在下载 Snell ${version}...${SNELL_RESET}" >&2
+    if ! wget --timeout=30 --tries=3 -q --show-progress "${snell_url}" -O "$tmp_zip" || [ ! -s "$tmp_zip" ]; then
+        echo -e "${SNELL_RED}下载 Snell v6 失败。${SNELL_RESET}" >&2
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 下载 Snell v6 失败" >> "$SNELLV6_LOG_FILE"
+        rm -f "$tmp_zip"; rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    if ! unzip -t "$tmp_zip" >/dev/null 2>&1 || ! unzip -o "$tmp_zip" -d "$tmp_dir" >/dev/null 2>&1; then
+        echo -e "${SNELL_RED}Snell v6 压缩包损坏或解压失败。${SNELL_RESET}" >&2
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 解压 Snell v6 失败" >> "$SNELLV6_LOG_FILE"
+        rm -f "$tmp_zip"; rm -rf "$tmp_dir"
+        return 1
+    fi
+    rm -f "$tmp_zip"
+
+    if [ ! -f "${tmp_dir}/snell-server" ]; then
+        echo -e "${SNELL_RED}解压后未找到 snell-server 二进制。${SNELL_RESET}" >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    echo "$tmp_dir"
+}
+
+# 当前所有 v6 端口（去重升序 CSV）
+snellv6_current_ports_csv() {
+    local unit port ports
+    ports=""
+    while IFS= read -r unit; do
+        port=$(snellv6_unit_port "$unit" 2>/dev/null || true)
+        if snell_valid_port "$port"; then
+            if [ -n "$ports" ]; then
+                ports="${ports}
+${port}"
+            else
+                ports="$port"
+            fi
+        fi
+    done < <(snellv6_list_units)
+
+    if [ -n "$ports" ]; then
+        printf '%s\n' "$ports" | sort -un | paste -sd, -
+    fi
+}
+
+# 同步 v6 保留端口（关键：源隔离 + 加法 runtime，永不碰 v5 文件与 v5 的 runtime 端口）
+# 文件 99-zzy 排在 v5 的 99-zzz 之前 → 开机 v5 最后应用 → v5 端口保护结构性不被覆盖
+snellv6_sync_reserved_ports() {
+    local ports_csv cur new tmp_file
+    ports_csv=$(snellv6_current_ports_csv)
+
+    # 1) 持久化 v6 文件：只含 v6 端口，绝不扫描/合并任何其它 sysctl 文件
+    if [ -n "$ports_csv" ]; then
+        tmp_file=$(mktemp /tmp/snellv6-reserved-ports.XXXXXX) || return 1
+        cat > "$tmp_file" <<EOF
+# SnellV6 监听端口保留列表（由 net-tcp-tune 自动管理，请勿手动修改）
+# 仅含 SnellV6 端口；v5 的保留端口由 99-zzz-snell-reserved-ports.conf 独立管理，本文件绝不触碰
+# 文件名 99-zzy 排在 v5 的 99-zzz 之前：开机时 v5 文件最后应用，确保 v5 端口保护不被覆盖
+net.ipv4.ip_local_reserved_ports = ${ports_csv}
+EOF
+        mv "$tmp_file" "$SNELLV6_RESERVED_FILE" || { rm -f "$tmp_file" 2>/dev/null; return 1; }
+    else
+        rm -f "$SNELLV6_RESERVED_FILE" 2>/dev/null
+    fi
+
+    # 2) runtime 加法应用：读当前值→并入 v6 端口→写回。只增不减，绝不抹掉 v5/第三方 runtime 端口。
+    #    W-1 红线：用 sysctl 退出码判断读是否成功；读失败一律跳过，绝不用残缺值覆盖。
+    if [ -n "$ports_csv" ]; then
+        if cur=$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null); then
+            # 读成功：cur 可能为空(内核当前无保留端口，无 v5 端口可丢)，也可能含 v5/第三方端口
+            new=$(printf '%s,%s\n' "$cur" "$ports_csv" | snell_normalize_reserved_ports)
+            [ -n "$new" ] && sysctl -w "net.ipv4.ip_local_reserved_ports=${new}" >/dev/null 2>&1 || true
+        fi
+        # 读失败：不写 runtime（持久化文件已就绪，下次重启/v5 操作会生效）
+    fi
+    return 0
+}
+
+# 把北京时间转本地时间后注册 v6 每日重启 cron（标记 # SnellV6每日重启，与 v5 的 # Snell每日重启 互不误删）
+snellv6_install_daily_restart_cron() {
+    local systemctl_bin tmp_cron local_h local_m cron_active=0 cron_service
+
+    if ! command -v crontab >/dev/null 2>&1; then
+        echo -e "  ${SNELL_YELLOW}⚠ 未安装 crontab，跳过每日重启兜底${SNELL_RESET}"
+        echo -e "      Debian/Ubuntu: apt install -y cron"
+        echo -e "      CentOS/Rocky:  yum install -y cronie"
+        return 0
+    fi
+
+    systemctl_bin=$(command -v systemctl 2>/dev/null || echo "/bin/systemctl")
+    cat > "$SNELLV6_DAILY_WRAPPER" <<EOF
+#!/bin/sh
+# Snell v6 每日重启 wrapper（由 net-tcp-tune 自动生成，请勿手动修改）
+# 只重启当前 active 的 snellv6-端口.service，绝不触碰 v5 的 snell-*.service / snell.service
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+SYSTEMCTL_BIN="${systemctl_bin}"
+LOCK_FILE="${SNELLV6_LOCK_FILE}"
+
+restart_active_snellv6() {
+    seen_units=""
+    for dir in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do
+        for svc in "\$dir"/snellv6-*.service; do
+            [ -f "\$svc" ] || continue
+            unit=\$(basename "\$svc")
+            echo "\$unit" | grep -Eq '^snellv6-[0-9]+\.service$' || continue
+            case " \$seen_units " in
+                *" \$unit "*) continue ;;
+            esac
+            seen_units="\$seen_units \$unit"
+            "\$SYSTEMCTL_BIN" is-active --quiet "\$unit" 2>/dev/null && \
+                "\$SYSTEMCTL_BIN" restart "\$unit" >/dev/null 2>&1
+        done
+    done
+}
+
+if command -v flock >/dev/null 2>&1; then
+    (
+        flock -n 9 || exit 0
+        restart_active_snellv6
+    ) 9>"\$LOCK_FILE"
+else
+    restart_active_snellv6
+fi
+EOF
+    chmod +x "$SNELLV6_DAILY_WRAPPER"
+
+    read -r local_h local_m < <(snell_bj_to_local_time 04 10)
+    tmp_cron=$(mktemp) || return 1
+    crontab -l 2>/dev/null | grep -v "# SnellV6每日重启" > "$tmp_cron" || true
+    echo "${local_m} ${local_h} * * * ${SNELLV6_DAILY_WRAPPER} >/dev/null 2>&1  # SnellV6每日重启" >> "$tmp_cron"
+    if crontab "$tmp_cron" 2>/dev/null; then
+        rm -f "$tmp_cron"
+        echo -e "  ${SNELL_GREEN}✓ 已注册每日北京时间 04:10 自动重启兜底（本地时间 ${local_h}:${local_m}）${SNELL_RESET}"
+    else
+        echo -e "  ${SNELL_RED}✗ 注册 v6 每日重启 cron 失败（临时文件保留: $tmp_cron）${SNELL_RESET}"
+        return 1
+    fi
+
+    for cron_service in cron crond cronie cronie.service; do
+        if systemctl is-active --quiet "$cron_service" 2>/dev/null; then
+            cron_active=1
+            break
+        fi
+    done
+    if [ "$cron_active" -eq 0 ]; then
+        echo -e "  ${SNELL_YELLOW}⚠ cron 服务未运行，定时任务不会触发${SNELL_RESET}"
+        echo -e "      Debian/Ubuntu: ${SNELL_CYAN}systemctl enable --now cron${SNELL_RESET}"
+        echo -e "      CentOS/Rocky:  ${SNELL_CYAN}systemctl enable --now crond${SNELL_RESET}"
+    fi
+}
+
+# 重启指定 v6 单元并健康验证（reset-failed 逐单元带名，满足 W-2）
+snellv6_restart_units_with_healthcheck() {
+    local unit restart_count=0 restart_failed=0
+
+    if [ "$#" -eq 0 ]; then
+        echo -e "${SNELL_YELLOW}没有需要重启的 Snell v6 实例（已停止/禁用的实例不会被自动拉起）${SNELL_RESET}"
+        return 0
+    fi
+
+    for unit in "$@"; do
+        systemctl reset-failed "$unit" 2>/dev/null || true
+        if systemctl restart "$unit"; then
+            sleep 2
+            if systemctl is-active --quiet "$unit"; then
+                restart_count=$((restart_count + 1))
+                echo -e "  ${SNELL_GREEN}✓ 已重启并确认运行: ${unit}${SNELL_RESET}"
+            else
+                restart_failed=$((restart_failed + 1))
+                echo -e "  ${SNELL_RED}✗ ${unit} 重启后未保持运行${SNELL_RESET}"
+                journalctl -u "$unit" -n 20 --no-pager 2>/dev/null || true
+            fi
+        else
+            restart_failed=$((restart_failed + 1))
+            echo -e "  ${SNELL_RED}✗ 重启失败: ${unit}${SNELL_RESET}"
+            journalctl -u "$unit" -n 20 --no-pager 2>/dev/null || true
+        fi
+    done
+
+    echo -e "${SNELL_GREEN}Snell v6 重启完成：成功 ${restart_count} 个，失败 ${restart_failed} 个${SNELL_RESET}"
+    [ "$restart_failed" -eq 0 ]
+}
+
+# 补齐 v6 稳定性防护（无 drop-in：v6 单元出生即带全套防护；reset-failed 逐单元带名，满足 W-2）
+snellv6_apply_runtime_guards() {
+    local enable_cron="${1:-no}"
+    local unit failed=0 ports_csv
+    local -a units=()
+
+    while IFS= read -r unit; do
+        units+=("$unit")
+    done < <(snellv6_list_units)
+
+    if [ "${#units[@]}" -eq 0 ]; then
+        echo -e "  ${SNELL_YELLOW}⚠ 未找到 Snell v6 实例，跳过稳定性修复${SNELL_RESET}"
+        return 0
+    fi
+
+    echo -e "${SNELL_CYAN}正在补齐 Snell v6 稳定性防护...${SNELL_RESET}"
+
+    if snellv6_sync_reserved_ports; then
+        ports_csv=$(snellv6_current_ports_csv)
+        echo -e "  ${SNELL_GREEN}✓ 已保护 Snell v6 监听端口: ${ports_csv:-无}${SNELL_RESET}"
+    else
+        failed=$((failed + 1))
+        echo -e "  ${SNELL_RED}✗ Snell v6 端口保留写入失败${SNELL_RESET}"
+    fi
+
+    if systemctl daemon-reload; then
+        echo -e "  ${SNELL_GREEN}✓ systemd 配置已重载${SNELL_RESET}"
+    else
+        failed=$((failed + 1))
+        echo -e "  ${SNELL_RED}✗ systemd daemon-reload 失败${SNELL_RESET}"
+    fi
+
+    for unit in "${units[@]}"; do
+        systemctl reset-failed "$unit" 2>/dev/null || true
+    done
+    echo -e "  ${SNELL_GREEN}✓ 已清理 Snell v6 failed 状态${SNELL_RESET}"
+
+    if [ "$enable_cron" = "yes" ]; then
+        snellv6_install_daily_restart_cron || failed=$((failed + 1))
+    fi
+
+    [ "$failed" -eq 0 ]
+}
+
+# v6 健康检查（不查 drop-in，因 v6 单元出生即完整）
+snellv6_health_check() {
+    local unit port active_state enabled_state listen_state reserved_list reserved_state
+    local count=0 problem=0 wrapper_state cron_line cron_state
+
+    echo -e "${SNELL_CYAN}=== Snell v6 健康检查 ===${SNELL_RESET}"
+    reserved_list=$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)
+
+    while IFS= read -r unit; do
+        count=$((count + 1))
+        port=$(snellv6_unit_port "$unit" 2>/dev/null || echo "未知")
+        active_state=$(systemctl is-active "$unit" 2>/dev/null)
+        enabled_state=$(systemctl is-enabled "$unit" 2>/dev/null)
+        [ -n "$active_state" ] || active_state="unknown"
+        [ -n "$enabled_state" ] || enabled_state="unknown"
+
+        listen_state="未检测"
+        if snell_valid_port "$port"; then
+            if ss -ltnH "( sport = :${port} )" 2>/dev/null | grep -q . || \
+               ss -lunH "( sport = :${port} )" 2>/dev/null | grep -q .; then
+                listen_state="已监听"
+            else
+                listen_state="未监听"
+                [ "$active_state" = "active" ] && problem=$((problem + 1))
+            fi
+        fi
+
+        reserved_state="未检测"
+        if snell_valid_port "$port"; then
+            if snell_reserved_contains_port "$reserved_list" "$port"; then
+                reserved_state="已保护"
+            else
+                reserved_state="未保护"
+                problem=$((problem + 1))
+            fi
+        fi
+
+        echo "  - ${unit}: 状态=${active_state}/${enabled_state}, 端口=${port}, 监听=${listen_state}, 端口保留=${reserved_state}"
+    done < <(snellv6_list_units)
+
+    if [ "$count" -eq 0 ]; then
+        echo -e "${SNELL_YELLOW}未找到 Snell v6 实例${SNELL_RESET}"
+        return 1
+    fi
+
+    wrapper_state="未安装"
+    [ -x "$SNELLV6_DAILY_WRAPPER" ] && wrapper_state="已安装"
+    cron_line=$(crontab -l 2>/dev/null | grep "SnellV6每日重启" || true)
+    cron_state="未注册"
+    [ -n "$cron_line" ] && cron_state="已注册"
+    echo "  - 每日重启兜底: wrapper=${wrapper_state}, cron=${cron_state}"
+
+    if [ "$problem" -eq 0 ]; then
+        echo -e "${SNELL_GREEN}健康检查结果：基础防护已就绪。${SNELL_RESET}"
+        return 0
+    else
+        echo -e "${SNELL_YELLOW}健康检查结果：发现 ${problem} 个需修复项（可用菜单 4「更新+修复」处理）。${SNELL_RESET}"
+        return 1
+    fi
+}
+
+# 列出所有 v6 实例
+list_snellv6_instances() {
+    echo -e "${SNELL_CYAN}当前已安装的 Snell v6 实例：${SNELL_RESET}"
+    echo "================================================================"
+    printf "%-30s %-12s %-12s %-10s\n" "节点名称" "端口" "状态" "版本"
+    echo "================================================================"
+
+    local count=0 unit port status_text node_name
+
+    while IFS= read -r unit; do
+        port=$(snellv6_unit_port "$unit" 2>/dev/null || echo "未知")
+        status_text="已停止"
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            status_text="运行中"
+        elif [ "$(systemctl is-active "$unit" 2>/dev/null)" = "failed" ]; then
+            status_text="异常"
+        fi
+
+        node_name="未命名"
+        if snell_valid_port "$port" && [ -f "${SNELLV6_CONF_DIR}/config-${port}.txt" ]; then
+            node_name=$(head -n 1 "${SNELLV6_CONF_DIR}/config-${port}.txt" | awk -F' = ' '{print $1}')
+        fi
+
+        if [ "$status_text" = "运行中" ]; then
+            printf "%-30s %-12s ${SNELL_GREEN}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "v6"
+        elif [ "$status_text" = "异常" ]; then
+            printf "%-30s %-12s ${SNELL_YELLOW}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "v6"
+        else
+            printf "%-30s %-12s ${SNELL_RED}%-12s${SNELL_RESET} %-10s\n" "$node_name" "$port" "$status_text" "v6"
+        fi
+        count=$((count + 1))
+    done < <(snellv6_list_units)
+
+    if [ "$count" -eq 0 ]; then
+        echo "暂无安装任何 Snell v6 实例"
+    fi
+    echo "================================================================"
+    echo ""
+    return $count
+}
+
+# 实时生成并输出 v6 客户端配置（换 IP 后实时刷新；version=6）
+show_snellv6_config_live() {
+    local port="$1"
+    local conf_file="${SNELLV6_CONF_DIR}/snell-${port}.conf"
+    local saved_file="${SNELLV6_CONF_DIR}/config-${port}.txt"
+
+    if ! snell_valid_port "$port"; then
+        echo -e "${SNELL_RED}无效端口，请输入 1-65535 之间的数字${SNELL_RESET}"
+        return 1
+    fi
+    if [ ! -f "$conf_file" ]; then
+        echo -e "${SNELL_RED}未找到端口 ${port} 的 Snell v6 配置文件${SNELL_RESET}"
+        return 1
+    fi
+
+    local saved_line node_name psk listen_line ip_mode ip_version_str host_ip host_ip_formatted final_config
+    saved_line=""
+    [ -f "$saved_file" ] && saved_line=$(head -n 1 "$saved_file" 2>/dev/null)
+
+    if [ -n "$saved_line" ] && echo "$saved_line" | grep -q " = snell,"; then
+        node_name=$(echo "$saved_line" | sed -E 's/[[:space:]]*=[[:space:]]*snell,.*$//')
+    else
+        node_name="SnellV6-Node-${port}"
+    fi
+
+    psk=$(grep -E '^[[:space:]]*psk[[:space:]]*=' "$conf_file" 2>/dev/null | tail -n 1 | sed -E 's/^[^=]+=[[:space:]]*//; s/[[:space:]]*$//')
+    if [ -z "$psk" ]; then
+        echo -e "${SNELL_RED}未能从 ${conf_file} 读取 PSK，无法生成客户端配置${SNELL_RESET}"
+        return 1
+    fi
+
+    # 从 listen 行判断监听模式 → 客户端 ip-version 后缀
+    listen_line=$(grep -E '^[[:space:]]*listen[[:space:]]*=' "$conf_file" 2>/dev/null | tail -n 1)
+    if echo "$listen_line" | grep -q '0.0.0.0' && echo "$listen_line" | grep -q '\[::\]'; then
+        ip_mode="dual"
+        ip_version_str=""
+    elif echo "$listen_line" | grep -q '\[::\]'; then
+        ip_mode="v6-only"
+        ip_version_str=", ip-version=v6-only"
+    else
+        ip_mode="v4-only"
+        ip_version_str=", ip-version=v4-only"
+    fi
+
+    host_ip=$(get_snell_public_ip "$ip_mode")
+    if [ -z "$host_ip" ]; then
+        echo -e "${SNELL_YELLOW}⚠ 无法自动获取公网 IP，节点链接里的 IP 需手动替换${SNELL_RESET}"
+        host_ip="<请手动填写公网IP>"
+    fi
+    host_ip_formatted="$host_ip"
+    if echo "$host_ip" | grep -q ":"; then
+        host_ip_formatted="[${host_ip}]"
+    fi
+
+    final_config="${node_name} = snell, ${host_ip_formatted}, ${port}, psk=${psk}, version=6${ip_version_str}"
+    echo -e "${SNELL_CYAN}${final_config}${SNELL_RESET}"
+
+    if [ "$host_ip" != "<请手动填写公网IP>" ]; then
+        echo "$final_config" > "$saved_file" 2>/dev/null && chmod 600 "$saved_file" 2>/dev/null || true
+    fi
+}
+
+# v6 安装失败回滚（只清自己端口，绝不动 v5；保留端口重新同步去掉失败端口）
+cleanup_partial_install_snellv6() {
+    local port="$1"
+    if [ -n "$port" ]; then
+        systemctl stop "snellv6-${port}.service" 2>/dev/null
+        systemctl disable "snellv6-${port}.service" 2>/dev/null
+        systemctl reset-failed "snellv6-${port}.service" 2>/dev/null
+        rm -f "/etc/systemd/system/snellv6-${port}.service"
+        rm -rf "/etc/systemd/system/snellv6-${port}.service.d" 2>/dev/null
+        rm -f "${SNELLV6_CONF_DIR}/snell-${port}.conf"
+        rm -f "${SNELLV6_CONF_DIR}/config-${port}.txt"
+        systemctl daemon-reload 2>/dev/null
+        snellv6_sync_reserved_ports 2>/dev/null || true
+    fi
+    rm -f /tmp/snellv6-server.*.zip 2>/dev/null
+    rm -rf /tmp/snellv6-dl.* 2>/dev/null
+}
+
+# 安装 v6 实例
+install_snellv6() {
+    echo -e "${SNELL_GREEN}=== 安装 Snell v6 Beta 实例 ===${SNELL_RESET}"
+    echo -e "${SNELL_YELLOW}⚠ Beta 提示：客户端需 Surge Mac Beta 渠道或 iOS TestFlight；${SNELL_RESET}"
+    echo -e "${SNELL_YELLOW}  App Store 正式版 Surge 无法连接 v6 节点；协议 Beta 期可能不兼容变动。${SNELL_RESET}"
+    echo ""
+
+    wait_for_package_manager_snell
+    if ! install_required_packages_snell; then
+        echo -e "${SNELL_RED}安装必要软件包失败，请检查网络连接。${SNELL_RESET}"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - v6 安装必要软件包失败" >> "$SNELLV6_LOG_FILE"
+        return 1
+    fi
+
+    mkdir -p "$SNELLV6_CONF_DIR"
+
+    # snell 用户/组（与 v5 共享；幂等，存在则不改任何属性）
+    if ! getent group "snell" &>/dev/null; then
+        groupadd -r snell
+    fi
+    if ! id "snell" &>/dev/null; then
+        useradd -r -g snell -s /usr/sbin/nologin -d /nonexistent snell 2>/dev/null || \
+        useradd -r -g snell -s /sbin/nologin -d /nonexistent snell
+    fi
+
+    # 下载二进制（带版本标记校验：存在且版本匹配则跳过）
+    local need_download=1
+    if [ -f "$SNELLV6_BIN" ] && [ -f "$SNELLV6_VERSION_FILE" ] && \
+       [ "$(cat "$SNELLV6_VERSION_FILE" 2>/dev/null)" = "${SNELL_V6_DEFAULT_VERSION}" ]; then
+        need_download=0
+        echo -e "${SNELL_GREEN}已存在 v${SNELL_V6_DEFAULT_VERSION} 内核，跳过下载。${SNELL_RESET}"
+    fi
+    if [ "$need_download" -eq 1 ]; then
+        local dl_dir
+        dl_dir=$(snellv6_download_binary) || { cleanup_partial_install_snellv6 ""; return 1; }
+        if ! install -m 755 "${dl_dir}/snell-server" "${SNELLV6_BIN}"; then
+            echo -e "${SNELL_RED}安装 snell-server-v6 到 ${SNELLV6_BIN} 失败。${SNELL_RESET}"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 安装 snell-server-v6 失败" >> "$SNELLV6_LOG_FILE"
+            rm -rf "$dl_dir"; cleanup_partial_install_snellv6 ""; return 1
+        fi
+        rm -rf "$dl_dir"
+        echo "${SNELL_V6_DEFAULT_VERSION}" > "$SNELLV6_VERSION_FILE"
+    fi
+
+    # 选端口（默认随机 30000-39999，与 v5 默认段 10000-29999 错开，撞号率归零）
+    local snellv6_port custom_port
+    snellv6_port=$(shuf -i 30000-39999 -n 1)
+    echo -e "${SNELL_CYAN}请输入端口号 (1-65535)，直接回车使用随机端口 [默认: ${snellv6_port}]:${SNELL_RESET}"
+    while true; do
+        read -p "端口: " custom_port
+        if [ -z "$custom_port" ]; then
+            echo -e "${SNELL_GREEN}使用随机端口: ${snellv6_port}${SNELL_RESET}"
+            break
+        fi
+        if snell_valid_port "$custom_port"; then
+            snellv6_port="$custom_port"
+            echo -e "${SNELL_GREEN}已设置端口为: ${snellv6_port}${SNELL_RESET}"
+            break
+        else
+            echo -e "${SNELL_RED}无效端口，请输入 1-65535 之间的数字，或直接回车使用随机端口${SNELL_RESET}"
+        fi
+    done
+
+    # 端口占用检查：ss 实际监听 + v6/v5 unit 文件（含旧版 snell.service），即使停止也拒绝（保护 v5）
+    local port_in_use=0
+    if ss -ltnH "( sport = :${snellv6_port} )" 2>/dev/null | grep -q .; then
+        port_in_use=1
+    elif ss -lunH "( sport = :${snellv6_port} )" 2>/dev/null | grep -q .; then
+        port_in_use=1
+    fi
+    if [ "$port_in_use" -eq 1 ]; then
+        echo -e "${SNELL_RED}端口 ${snellv6_port} 已被占用，请选择其他端口。${SNELL_RESET}"
+        return 1
+    fi
+    if [ -f "/etc/systemd/system/snellv6-${snellv6_port}.service" ]; then
+        echo -e "${SNELL_RED}端口 ${snellv6_port} 的 v6 实例已存在，请换端口或先卸载。${SNELL_RESET}"
+        return 1
+    fi
+    if [ -f "/etc/systemd/system/snell-${snellv6_port}.service" ] || [ -f "/lib/systemd/system/snell-${snellv6_port}.service" ]; then
+        echo -e "${SNELL_RED}端口 ${snellv6_port} 已被 v5 实例占用，请换端口（保护 v5）。${SNELL_RESET}"
+        return 1
+    fi
+    if [ -f "/etc/snell/snell-server.conf" ]; then
+        local v5_old_port
+        v5_old_port=$(grep -E '^[[:space:]]*listen[[:space:]]*=' /etc/snell/snell-server.conf 2>/dev/null | tail -n 1 | sed -E 's/.*:([0-9]+).*/\1/')
+        if [ "$v5_old_port" = "$snellv6_port" ]; then
+            echo -e "${SNELL_RED}端口 ${snellv6_port} 已被 v5 旧版实例占用，请换端口（保护 v5）。${SNELL_RESET}"
+            return 1
+        fi
+    fi
+
+    # 节点名称
+    local node_name
+    echo -e "${SNELL_CYAN}请输入节点名称 (例如: 🇯🇵【v6测试】JP):${SNELL_RESET}"
+    read -p "节点名称: " node_name
+    if [ -z "$node_name" ]; then
+        node_name="SnellV6-Node-${snellv6_port}"
+        echo -e "${SNELL_YELLOW}未输入名称，使用默认名称: ${node_name}${SNELL_RESET}"
+    fi
+
+    # 监听模式（只决定 inbound listen + 客户端 ip-version 后缀；dns-ip-preference 与之正交）
+    local listen_mode listen_addr ip_version_str
+    echo -e "${SNELL_CYAN}请选择监听模式:${SNELL_RESET}"
+    echo "1. 仅 IPv4 (0.0.0.0)"
+    echo "2. 仅 IPv6 ([::])"
+    echo "3. 双栈 (同时支持 IPv4 和 IPv6)"
+    read -p "请输入选项 [1-3，默认为 1]: " listen_mode
+    listen_mode=${listen_mode:-1}
+    case "$listen_mode" in
+        2)
+            listen_addr="[::]:${snellv6_port}"
+            ip_version_str=", ip-version=v6-only"
+            echo -e "${SNELL_GREEN}已选择：仅 IPv6 模式${SNELL_RESET}"
+            ;;
+        3)
+            listen_addr="0.0.0.0:${snellv6_port},[::]:${snellv6_port}"
+            ip_version_str=""
+            echo -e "${SNELL_GREEN}已选择：双栈模式${SNELL_RESET}"
+            ;;
+        *)
+            listen_addr="0.0.0.0:${snellv6_port}"
+            ip_version_str=", ip-version=v4-only"
+            echo -e "${SNELL_GREEN}已选择：仅 IPv4 模式${SNELL_RESET}"
+            ;;
+    esac
+
+    # PSK（v6 用 PSK 派生混淆特征，加长到 32）
+    local random_psk
+    random_psk=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)
+
+    # 写配置文件（dns-ip-preference 是 outbound 解析偏好，与监听栈正交，统一用安全的 default）
+    local conf_file="${SNELLV6_CONF_DIR}/snell-${snellv6_port}.conf"
+    cat > "$conf_file" <<EOF
+[snell-server]
+listen = ${listen_addr}
+psk = ${random_psk}
+dns-ip-preference = default
+EOF
+    echo -e "${SNELL_CYAN}提示: dns-ip-preference 可选 default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only，如需修改请编辑 ${conf_file}${SNELL_RESET}"
+
+    chown snell:snell "$SNELLV6_CONF_DIR"
+    chmod 750 "$SNELLV6_CONF_DIR"
+    chown snell:snell "$conf_file"
+    chmod 640 "$conf_file"
+
+    # 写 systemd 单元（出生即带全套稳定性防护，无需后续 drop-in）
+    local unit_file="/etc/systemd/system/snellv6-${snellv6_port}.service"
+    cat > "$unit_file" <<EOF
+[Unit]
+Description=Snell V6 Proxy Service (Port ${snellv6_port})
+After=network.target network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+StartLimitInterval=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+User=snell
+Group=snell
+ExecStart=${SNELLV6_BIN} -c ${conf_file}
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+LimitNOFILE=32768
+Restart=always
+RestartSec=10
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=5s
+OOMScoreAdjust=-500
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=snellv6-${snellv6_port}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    if ! systemctl daemon-reload; then
+        echo -e "${SNELL_RED}重载 Systemd 配置失败。${SNELL_RESET}"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - v6 daemon-reload 失败" >> "$SNELLV6_LOG_FILE"
+        cleanup_partial_install_snellv6 "$snellv6_port"
+        return 1
+    fi
+    if ! systemctl enable "snellv6-${snellv6_port}.service"; then
+        echo -e "${SNELL_RED}设置开机自启失败。${SNELL_RESET}"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - v6 enable 失败" >> "$SNELLV6_LOG_FILE"
+        cleanup_partial_install_snellv6 "$snellv6_port"
+        return 1
+    fi
+
+    # 先注册保留端口（start 之前，避免窗口期被 outbound 抢占）
+    snellv6_sync_reserved_ports || true
+
+    if ! systemctl start "snellv6-${snellv6_port}.service"; then
+        echo -e "${SNELL_RED}启动 Snell v6 服务失败。${SNELL_RESET}"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 启动 Snell v6 失败" >> "$SNELLV6_LOG_FILE"
+        cleanup_partial_install_snellv6 "$snellv6_port"
+        return 1
+    fi
+    sleep 2
+    if ! systemctl is-active --quiet "snellv6-${snellv6_port}.service"; then
+        echo -e "${SNELL_RED}Snell v6 启动后立即崩溃，请检查日志：${SNELL_RESET}"
+        journalctl -u "snellv6-${snellv6_port}.service" -n 20 --no-pager 2>/dev/null
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - Snell v6 启动后立即崩溃" >> "$SNELLV6_LOG_FILE"
+        cleanup_partial_install_snellv6 "$snellv6_port"
+        return 1
+    fi
+    echo -e "${SNELL_GREEN}Snell v6 (端口 ${snellv6_port}) 安装成功${SNELL_RESET}"
+    journalctl -u "snellv6-${snellv6_port}.service" -n 8 --no-pager 2>/dev/null || true
+
+    # 获取公网 IP（按监听模式分流）
+    local host_ip=""
+    case "$listen_mode" in
+        2)
+            host_ip=$(curl -6 -s --max-time 5 https://api64.ipify.org 2>/dev/null)
+            [ -z "$host_ip" ] && host_ip=$(curl -6 -s --max-time 5 https://ifconfig.co 2>/dev/null)
+            ;;
+        3)
+            host_ip=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null)
+            [ -z "$host_ip" ] && host_ip=$(curl -6 -s --max-time 5 https://api64.ipify.org 2>/dev/null)
+            ;;
+        *)
+            host_ip=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null)
+            [ -z "$host_ip" ] && host_ip=$(curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null)
+            ;;
+    esac
+    if [ -z "$host_ip" ]; then
+        echo -e "${SNELL_YELLOW}⚠ 无法自动获取公网 IP，节点链接里的 IP 需手动替换${SNELL_RESET}"
+        host_ip="<请手动填写公网IP>"
+    fi
+    local host_ip_formatted="$host_ip"
+    if echo "$host_ip" | grep -q ":"; then
+        host_ip_formatted="[${host_ip}]"
+    fi
+
+    local final_config="${node_name} = snell, ${host_ip_formatted}, ${snellv6_port}, psk=${random_psk}, version=6${ip_version_str}"
+    echo ""
+    echo -e "${SNELL_GREEN}节点信息输出（Surge 客户端需 v6 Beta 渠道）：${SNELL_RESET}"
+    echo -e "${SNELL_CYAN}${final_config}${SNELL_RESET}"
+
+    cat > "${SNELLV6_CONF_DIR}/config-${snellv6_port}.txt" <<EOF
+${final_config}
+EOF
+    chmod 600 "${SNELLV6_CONF_DIR}/config-${snellv6_port}.txt"
+
+    # 注册每日重启兜底（v6 是 Beta，兜底更重要）
+    snellv6_install_daily_restart_cron || true
+}
+
+# v6 更新内核 + 一键修复（合并为一项）
+snellv6_update_and_repair() {
+    local repair_failed=0
+    local unit svc_name
+    local -a units=() restart_targets=()
+
+    echo -e "${SNELL_GREEN}=== Snell v6 更新内核 + 一键修复（合并）===${SNELL_RESET}"
+    echo -e "${SNELL_CYAN}不会删除任何节点配置；补齐稳定性防护、按需更新二进制、并重启需恢复的实例。${SNELL_RESET}"
+
+    if ! snellv6_acquire_lock; then
+        return 1
+    fi
+
+    while IFS= read -r unit; do
+        units+=("$unit")
+    done < <(snellv6_list_units)
+
+    if [ "${#units[@]}" -eq 0 ]; then
+        echo -e "${SNELL_YELLOW}未检测到 Snell v6 实例，无需处理。${SNELL_RESET}"
+        snellv6_release_lock
+        return 0
+    fi
+
+    # 先补齐稳定性防护（不动二进制）
+    snellv6_apply_runtime_guards yes || repair_failed=1
+
+    # 收集需恢复实例：active 或 failed+enabled（不自动拉起用户手动停止/禁用的实例）
+    for unit in "${units[@]}"; do
+        if snell_should_restart_unit "$unit"; then
+            restart_targets+=("$unit")
+        fi
+    done
+
+    # 二进制版本校验：已是目标版本则跳过下载，仅做修复重启
+    if [ -f "$SNELLV6_BIN" ] && [ -f "$SNELLV6_VERSION_FILE" ] && \
+       [ "$(cat "$SNELLV6_VERSION_FILE" 2>/dev/null)" = "${SNELL_V6_DEFAULT_VERSION}" ]; then
+        echo -e "${SNELL_GREEN}二进制已是 v${SNELL_V6_DEFAULT_VERSION}，跳过下载，仅做修复重启。${SNELL_RESET}"
+        snellv6_restart_units_with_healthcheck "${restart_targets[@]}" || repair_failed=1
+        snellv6_health_check || repair_failed=1
+        snellv6_release_lock
+        return "$repair_failed"
+    fi
+
+    # 需要更新二进制
+    wait_for_package_manager_snell
+    if ! install_required_packages_snell; then
+        echo -e "${SNELL_RED}安装必要软件包失败，请检查网络连接。${SNELL_RESET}"
+        snellv6_release_lock
+        return 1
+    fi
+
+    local TMP_DIR
+    if ! TMP_DIR=$(snellv6_download_binary); then
+        echo -e "${SNELL_YELLOW}⚠ 下载二进制失败，跳过更新，仅做修复重启。${SNELL_RESET}"
+        snellv6_restart_units_with_healthcheck "${restart_targets[@]}" || repair_failed=1
+        snellv6_health_check || repair_failed=1
+        snellv6_release_lock
+        return 1
+    fi
+
+    if [ -f "$SNELLV6_BIN" ]; then
+        if ! cp "$SNELLV6_BIN" "${SNELLV6_BIN}.bak"; then
+            echo -e "${SNELL_RED}备份旧二进制失败，已取消更新。${SNELL_RESET}"
+            rm -rf "$TMP_DIR"
+            snellv6_release_lock
+            return 1
+        fi
+    fi
+
+    echo -e "${SNELL_GREEN}正在停止需要恢复的 Snell v6 服务...${SNELL_RESET}"
+    for svc_name in "${restart_targets[@]}"; do
+        systemctl stop "$svc_name" 2>/dev/null
+    done
+
+    if ! mv "$TMP_DIR/snell-server" "${SNELLV6_BIN}"; then
+        echo -e "${SNELL_RED}二进制替换失败，回滚...${SNELL_RESET}"
+        [ -f "${SNELLV6_BIN}.bak" ] && mv "${SNELLV6_BIN}.bak" "${SNELLV6_BIN}" 2>/dev/null
+        for svc_name in "${restart_targets[@]}"; do
+            systemctl start "$svc_name" 2>/dev/null
+        done
+        rm -rf "$TMP_DIR"
+        snellv6_release_lock
+        return 1
+    fi
+    chmod +x "${SNELLV6_BIN}"
+    rm -rf "$TMP_DIR"
+    echo "${SNELL_V6_DEFAULT_VERSION}" > "$SNELLV6_VERSION_FILE"
+
+    echo -e "${SNELL_GREEN}正在重启并验证 Snell v6 服务...${SNELL_RESET}"
+    if ! snellv6_restart_units_with_healthcheck "${restart_targets[@]}"; then
+        echo -e "${SNELL_RED}有 Snell v6 服务重启失败，回滚到旧版本二进制...${SNELL_RESET}"
+        if [ -f "${SNELLV6_BIN}.bak" ]; then
+            mv "${SNELLV6_BIN}.bak" "${SNELLV6_BIN}"
+            chmod +x "${SNELLV6_BIN}"
+            for svc_name in "${restart_targets[@]}"; do
+                systemctl restart "$svc_name" 2>/dev/null
+            done
+            echo -e "${SNELL_YELLOW}已回滚到旧版本，请检查日志后重试。${SNELL_RESET}"
+        fi
+        snellv6_release_lock
+        return 1
+    fi
+
+    rm -f "${SNELLV6_BIN}.bak"
+    echo -e "${SNELL_GREEN}Snell v6 更新 + 修复完成${SNELL_RESET}"
+    snellv6_health_check || true
+    list_snellv6_instances
+    snellv6_release_lock
+    return "$repair_failed"
+}
+
+# 卸载 v6（单端口 / 全部；绝不 userdel/groupdel，绝不碰 v5 任何文件）
+uninstall_snellv6() {
+    echo -e "${SNELL_GREEN}=== 卸载 Snell v6 服务 ===${SNELL_RESET}"
+
+    list_snellv6_instances
+    local instance_count=$?
+
+    if [ "$instance_count" -eq 0 ]; then
+        echo -e "${SNELL_YELLOW}未检测到任何 Snell v6 实例，无需卸载。${SNELL_RESET}"
+        return
+    fi
+
+    echo "请选择卸载方式："
+    echo "1. 卸载指定端口的 v6 实例"
+    echo "2. 卸载所有 v6 实例（含二进制/配置目录/保留端口/每日重启）"
+    echo "0. 取消"
+    read -p "请输入选项 [0-2]: " uninstall_choice
+
+    case "$uninstall_choice" in
+        1)
+            read -p "请输入要卸载的端口号: " port_to_uninstall
+            if [ -z "$port_to_uninstall" ]; then
+                echo "端口号不能为空"
+                return
+            fi
+            if [ ! -f "/etc/systemd/system/snellv6-${port_to_uninstall}.service" ]; then
+                echo -e "${SNELL_RED}未找到端口为 ${port_to_uninstall} 的 Snell v6 实例${SNELL_RESET}"
+                return
+            fi
+            echo "正在卸载服务: snellv6-${port_to_uninstall}.service ..."
+            systemctl stop "snellv6-${port_to_uninstall}.service"
+            systemctl disable "snellv6-${port_to_uninstall}.service"
+            systemctl reset-failed "snellv6-${port_to_uninstall}.service" 2>/dev/null
+            rm -f "/etc/systemd/system/snellv6-${port_to_uninstall}.service"
+            rm -rf "/etc/systemd/system/snellv6-${port_to_uninstall}.service.d" 2>/dev/null
+            rm -f "${SNELLV6_CONF_DIR}/snell-${port_to_uninstall}.conf"
+            rm -f "${SNELLV6_CONF_DIR}/config-${port_to_uninstall}.txt"
+            systemctl daemon-reload
+            snellv6_sync_reserved_ports || true
+            echo -e "${SNELL_GREEN}v6 实例 ${port_to_uninstall} 卸载成功${SNELL_RESET}"
+            ;;
+        2)
+            echo "正在卸载所有 Snell v6 实例..."
+            local service_file port
+            for service_file in /etc/systemd/system/snellv6-*.service; do
+                [ -f "$service_file" ] || continue
+                port=$(echo "$service_file" | sed -E 's/.*snellv6-([0-9]+)\.service/\1/')
+                echo "卸载端口 $port ..."
+                systemctl stop "snellv6-${port}.service"
+                systemctl disable "snellv6-${port}.service"
+                systemctl reset-failed "snellv6-${port}.service" 2>/dev/null
+                rm -f "$service_file"
+                rm -rf "/etc/systemd/system/snellv6-${port}.service.d" 2>/dev/null
+            done
+
+            rm -rf "$SNELLV6_CONF_DIR"
+            rm -f "$SNELLV6_BIN"
+            # 删除 v6 保留端口文件（不动 v5；former v6 端口在 runtime 残留到下次重启，良性）
+            rm -f "$SNELLV6_RESERVED_FILE"
+            # 清理 v6 每日重启 wrapper + cron（精确标记 SnellV6每日重启，不碰 v5 的 Snell每日重启）
+            rm -f "$SNELLV6_DAILY_WRAPPER"
+            if command -v crontab >/dev/null 2>&1; then
+                local tmp_cron
+                tmp_cron=$(mktemp 2>/dev/null) && {
+                    crontab -l 2>/dev/null | grep -v "# SnellV6每日重启" > "$tmp_cron" || true
+                    crontab "$tmp_cron" 2>/dev/null
+                    rm -f "$tmp_cron"
+                }
+            fi
+
+            systemctl daemon-reload
+            echo -e "${SNELL_GREEN}所有 Snell v6 实例已卸载（snell 用户/组保留，v5 不受影响）${SNELL_RESET}"
+            ;;
+        *)
+            echo "已取消"
+            ;;
+    esac
+}
+
+# v6 管理菜单
+snellv6_menu() {
+    while true; do
+        clear
+        echo -e "${SNELL_CYAN}=== Snell v6 Beta 测试专区 🧪 ===${SNELL_RESET}"
+        echo -e "${SNELL_YELLOW}⚠ v6 仍是官方 Beta：客户端需 Surge Mac Beta 渠道 / iOS TestFlight；${SNELL_RESET}"
+        echo -e "${SNELL_YELLOW}  协议可能随 Beta 更新不兼容变动，两端需同步；勿承载主力线路。${SNELL_RESET}"
+        echo -e "${SNELL_CYAN}  与 v5 完全隔离：独立二进制/服务/配置目录/端口保留，互不影响。${SNELL_RESET}"
+
+        local instance_count=0 running_count=0 menu_unit
+        while IFS= read -r menu_unit; do
+            instance_count=$((instance_count + 1))
+            if systemctl is-active --quiet "$menu_unit" 2>/dev/null; then
+                running_count=$((running_count + 1))
+            fi
+        done < <(snellv6_list_units)
+        echo -e "已安装 v6 实例: ${SNELL_GREEN}${instance_count}${SNELL_RESET} 个，运行中: ${SNELL_GREEN}${running_count}${SNELL_RESET} 个"
+
+        local v6_ver="未安装"
+        [ -f "$SNELLV6_BIN" ] && v6_ver="v${SNELL_V6_DEFAULT_VERSION}"
+        echo -e "v6 内核: ${v6_ver}"
+        echo ""
+        echo "1. 安装/添加 Snell v6 实例"
+        echo "2. 卸载/删除 Snell v6 实例"
+        echo "3. 查看所有 v6 实例 / 查看节点配置"
+        echo "4. 更新 v6 内核 + 一键修复（合并）⭐ 推荐"
+        echo "5. v6 健康检查（只检测）"
+        echo "0. 返回上级菜单"
+        echo "======================"
+        read -p "请输入选项编号: " v6_choice
+
+        case "$v6_choice" in
+            1)
+                install_snellv6
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            2)
+                uninstall_snellv6
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            3)
+                echo ""
+                list_snellv6_instances
+                local v6_count=$?
+                if [ "$v6_count" -gt 0 ]; then
+                    echo ""
+                    read -p "输入要查看配置的端口号（直接回车跳过）: " view_port
+                    if [ -n "$view_port" ]; then
+                        if [ -f "${SNELLV6_CONF_DIR}/snell-${view_port}.conf" ]; then
+                            echo ""
+                            show_snellv6_config_live "$view_port"
+                        else
+                            echo -e "${SNELL_RED}未找到端口 ${view_port} 的 v6 配置文件${SNELL_RESET}"
+                        fi
+                    fi
+                fi
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            4)
+                snellv6_update_and_repair
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            5)
+                snellv6_health_check || true
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
                 ;;
             0) return ;;
             *) echo -e "${SNELL_RED}无效选项${SNELL_RESET}"; sleep 1 ;;
