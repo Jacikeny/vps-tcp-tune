@@ -8,14 +8,14 @@
 # 1. 正式版本迭代时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 临时热修/不发版时只修改 SCRIPT_LAST_UPDATE，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.0 更新: Snell v6 专区新增「检查更新」(菜单 12-8-6)，探测官方有无比内置更新的 v6 版本并给出升级引导；官方无版本清单接口故用有限窗口递增探测 (by Eric86777)
 # v5.1.8 更新: Snell v6 默认内核 6.0.0b1 → 6.0.0b2（官方 b2 修复了 b1 的速度回退）；已装 v6 的机器跑「更新 v6 内核 + 一键修复」生效，客户端需对应支持 b2 的 Surge beta (by Eric86777)
 # v5.1.7 更新: 撤回 v5.1.6 的 tfo=true（实测部分线路 TCP Fast Open 兼容性差，导致首包卡顿/偶发掉线），节点行回退到仅 reuse=true (by Eric86777)
 # v5.1.6 更新: Snell v5/v6 输出的客户端节点行补上 tfo=true（TCP Fast Open，新建连接省 1 个 RTT；服务端 tcp_fastopen=3 已由功能3配置）(by Eric86777)
 # v5.1.5 更新: Snell v6 输出的客户端节点行补上 reuse=true，与 v5 保持一致（TCP 连接复用，刷网页更跟手）(by Eric86777)
-# v5.1.4 更新: Snell v6 自检前主动装齐标准源运行库 libc-ares2+libuv1（避免逐个自检"打地鼠"），reactive 处理器补 libuv.so.1 兜底 (by Eric86777)
 
-SCRIPT_VERSION="5.1.8"
-SCRIPT_LAST_UPDATE="Snell v6 内核升级 6.0.0b1 → 6.0.0b2"
+SCRIPT_VERSION="5.2.0"
+SCRIPT_LAST_UPDATE="Snell v6 专区新增「检查更新」探测官方新版本"
 #=============================================================================
 
 #=============================================================================
@@ -9662,6 +9662,82 @@ snellv6_health_check() {
     fi
 }
 
+# 探测官方是否有比内置版本更新的 v6 版本
+# stdout 仅输出探测到的最新版本号（无更新则输出空），进度信息一律走 stderr
+# 官方无版本清单接口（dl 目录禁列 403、Surge 文档页已 404），只能从内置版本往后做有限窗口的递增探测
+snellv6_probe_latest_version() {
+    local arch a ver maj min pat bnum i p c code url latest=""
+    local -a candidates=()
+
+    arch=$(uname -m)
+    case "$arch" in
+        aarch64|arm64) a="aarch64" ;;
+        x86_64|amd64)  a="amd64" ;;
+        *) return 1 ;;
+    esac
+
+    ver="$SNELL_V6_DEFAULT_VERSION"
+    if [[ "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)b([0-9]+)$ ]]; then
+        # 内置是 beta：往后探 8 个 beta + 同 base 正式版及 3 个补丁 + 下个次版本
+        maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"; pat="${BASH_REMATCH[3]}"; bnum="${BASH_REMATCH[4]}"
+        for i in $(seq $((bnum + 1)) $((bnum + 8))); do candidates+=("${maj}.${min}.${pat}b${i}"); done
+        for p in $(seq "$pat" $((pat + 3))); do candidates+=("${maj}.${min}.${p}"); done
+        candidates+=("${maj}.$((min + 1)).0")
+    elif [[ "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        # 内置是正式版：往后探 4 个补丁 + 下个次版本
+        maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"; pat="${BASH_REMATCH[3]}"
+        for p in $(seq $((pat + 1)) $((pat + 4))); do candidates+=("${maj}.${min}.${p}"); done
+        candidates+=("${maj}.$((min + 1)).0")
+    else
+        return 1
+    fi
+
+    # candidates 数组按版本从低到高排列；遍历记录"存在的最高版本"（不因中间断档而提前停止）
+    for c in "${candidates[@]}"; do
+        url="https://dl.nssurge.com/snell/snell-server-v${c}-linux-${a}.zip"
+        code=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 8 -I "$url" 2>/dev/null)
+        [ "$code" = "200" ] && latest="$c"
+    done
+
+    [ -n "$latest" ] && echo "$latest"
+    return 0
+}
+
+# 「检查更新」菜单项：探测官方最新 v6 版本并与内置版本比较，发现新版给出升级引导
+# 刻意不在此直接安装探测到的版本——版本号以脚本内置常量为唯一基准，否则会与安装/更新里的
+# 版本校验逻辑冲突（下次「更新+修复」会把手动装的版本回退到内置版本）
+snellv6_check_update() {
+    local latest
+    echo -e "${SNELL_CYAN}=== 检查 Snell v6 是否有新版本 ===${SNELL_RESET}"
+    echo -e "${SNELL_CYAN}当前脚本内置版本: v${SNELL_V6_DEFAULT_VERSION}${SNELL_RESET}"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${SNELL_RED}缺少 curl，无法探测。${SNELL_RESET}"
+        return 1
+    fi
+
+    echo -e "${SNELL_YELLOW}正在探测官方下载服务器（官方无版本清单接口，采用有限窗口递增探测，请稍候）...${SNELL_RESET}"
+    latest=$(snellv6_probe_latest_version)
+
+    if [ -z "$latest" ]; then
+        echo -e "${SNELL_GREEN}✓ 未发现比 v${SNELL_V6_DEFAULT_VERSION} 更新的版本，当前已是脚本内置最新（或官方暂无新版）。${SNELL_RESET}"
+        echo -e "${SNELL_CYAN}  注：若官方刚发布跨度较大的新版本（超出探测窗口），可让脚本维护者再确认。${SNELL_RESET}"
+        return 0
+    fi
+
+    echo ""
+    echo -e "${SNELL_GREEN}🆕 发现官方新版本: v${latest}${SNELL_RESET}（当前内置 v${SNELL_V6_DEFAULT_VERSION}）"
+    echo ""
+    echo -e "${SNELL_CYAN}升级步骤（版本号以脚本内置常量为唯一基准，保证各机器一致、且不被默认更新逻辑回退）：${SNELL_RESET}"
+    echo -e "  ${SNELL_GREEN}1)${SNELL_RESET} 让脚本维护者把内置版本升级到 v${latest} 并发布"
+    echo -e "     （push 后在本机重跑 bbr 快捷命令即可拉到最新脚本）"
+    echo -e "  ${SNELL_GREEN}2)${SNELL_RESET} 再进本菜单「4. 更新 v6 内核 + 一键修复」即可平滑升级"
+    echo -e "     （节点配置 / 端口 / PSK 全部保留不变）"
+    echo ""
+    echo -e "${SNELL_YELLOW}⚠ 仍是 Beta：升级后客户端 Surge 需切到支持 v${latest} 的 Beta 渠道，两端版本要匹配。${SNELL_RESET}"
+    return 0
+}
+
 # 列出所有 v6 实例
 list_snellv6_instances() {
     echo -e "${SNELL_CYAN}当前已安装的 Snell v6 实例：${SNELL_RESET}"
@@ -10285,6 +10361,7 @@ snellv6_menu() {
         echo "3. 查看所有 v6 实例 / 查看节点配置"
         echo "4. 更新 v6 内核 + 一键修复（合并）⭐ 推荐"
         echo "5. v6 健康检查（只检测）"
+        echo "6. 检查 v6 是否有新版本 🔍"
         echo "0. 返回上级菜单"
         echo "======================"
         read -p "请输入选项编号: " v6_choice
@@ -10326,6 +10403,11 @@ snellv6_menu() {
                 ;;
             5)
                 snellv6_health_check || true
+                echo ""
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            6)
+                snellv6_check_update || true
                 echo ""
                 read -n 1 -s -r -p "按任意键继续..."
                 ;;
